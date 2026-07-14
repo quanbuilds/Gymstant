@@ -1,0 +1,39 @@
+{
+  "name": "gymstant",
+  "version": "0.1.0",
+  "private": true,
+  "author": "F10.0RD / Signal Labs",
+  "description": "A floating workflow teaching and verification assistant.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build": "vite build",
+    "start": "electron .",
+    "pack:mac": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir",
+    "pack:win": "npm run build && electron-builder --win dir --x64",
+    "pack:win:portable": "npm run build && electron-builder --win portable --x64 --publish never",
+    "test": "node --test test/**/*.test.cjs"
+  },
+  "build": {
+    "appId": "com.stewartinc.gymstant",
+    "productName": "Gymstant",
+    "directories": { "output": "release" },
+    "files": ["web-dist/**/*", "electron/**/*", "demo-training/MEMORY.md", "IDENTITY.md", "memory-dashboard.html", "package.json"],
+    "asarUnpack": ["electron/native/**/*"],
+    "mac": { "category": "public.app-category.productivity", "target": "dir" },
+    "win": { "target": "portable", "artifactName": "Gymstant-${version}-Windows.${ext}" }
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "lucide-react": "latest"
+  },
+  "devDependencies": {
+    "concurrently": "latest",
+    "electron": "latest",
+    "electron-builder": "latest",
+    "wait-on": "latest"
+  }
+}
