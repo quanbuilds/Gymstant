@@ -4,6 +4,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const zlib = require('zlib');
 const http = require('http');
+const os = require('os');
 const { TaskRuntime, originalRequest, isFalseSuccess } = require('./task-runtime.cjs');
 const { SpeedLayer, runSeededDemoFastPath } = require('./speed-layer.cjs');
 const { buildWorkflowManual, buildWorkflowRetirement, nextWindowMode } = require('./workflow-utils.cjs');
@@ -52,6 +53,82 @@ function gymstantCliPath() {
 function gymstantWorkdir() {
   if (process.env.GYMSTANT_WORKDIR) return process.env.GYMSTANT_WORKDIR;
   return isDev ? path.resolve(__dirname, '..') : dataDir;
+}
+
+function hermesHomeDir() {
+  if (process.env.HERMES_HOME) return process.env.HERMES_HOME;
+  return path.join(os.homedir(), '.hermes');
+}
+// The macOS `gymstant` CLI wrapper always runs `hermes -p gymstant`, isolating this
+// app to the "gymstant" profile. Windows has no wrapper/-p flag and targets the
+// user's default (root) Hermes profile — see gymstantCliPath().
+function hermesProfileDir() {
+  if (process.env.GYMSTANT_HERMES_PROFILE_DIR) return process.env.GYMSTANT_HERMES_PROFILE_DIR;
+  const home = hermesHomeDir();
+  return process.platform === 'darwin' ? path.join(home, 'profiles', 'gymstant') : home;
+}
+function hermesEnv() {
+  return { ...process.env, PATH: process.platform === 'win32' ? process.env.PATH : `/Users/stewartos/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}` };
+}
+// Lightweight sibling to runProcessGroup for short, non-cancelable, non-focus-aware
+// CLI calls (settings reads/writes). Deliberately does not touch activeExecution —
+// that singleton drives Cancel/focus-pause for real computer-use tasks, and a
+// concurrent settings call would clobber and then null it out mid-task.
+function runQuickProcess(file, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, args, { ...options, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const timer = setTimeout(() => { try { process.kill(-child.pid, 'SIGTERM'); } catch {} }, options.timeout || 20000);
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(Object.assign(new Error(stderr.trim() || `exit ${code}`), { code, stderr }));
+      resolve({ stdout, stderr });
+    });
+  });
+}
+function readHermesModelConfig() {
+  const configPath = path.join(hermesProfileDir(), 'config.yaml');
+  if (!fs.existsSync(configPath)) return null;
+  const lines = fs.readFileSync(configPath, 'utf8').split('\n');
+  const start = lines.findIndex(line => /^model:\s*$/.test(line));
+  if (start === -1) return null;
+  const model = {};
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    if (!/^\s/.test(line)) break; // dedented back to top level -> block ended
+    const match = line.match(/^\s+([A-Za-z_]+):\s*(.*)$/);
+    if (match) model[match[1]] = match[2].trim().replace(/^["']|["']$/g, '');
+  }
+  return Object.keys(model).length ? model : null;
+}
+function readHermesModelCatalog() {
+  const dir = hermesProfileDir();
+  if (!fs.existsSync(dir)) return { available: false, models: [], reason: 'no-profile' };
+  const cachePath = path.join(dir, 'cache', 'openrouter_model_metadata.json');
+  if (!fs.existsSync(cachePath)) return { available: false, models: [], reason: 'not-cached' };
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(cachePath, 'utf8')); } catch { return { available: false, models: [], reason: 'unreadable' }; }
+  const byName = new Map();
+  for (const [id, meta] of Object.entries(raw || {})) {
+    if (!meta || !meta.name) continue;
+    const existing = byName.get(meta.name);
+    const isCanonical = id.includes('/');
+    if (!existing || (isCanonical && !existing.id.includes('/'))) byName.set(meta.name, { id, name: meta.name, contextLength: meta.context_length || null });
+  }
+  return { available: true, models: [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)) };
+}
+function parseHermesToolsList(raw) {
+  const clean = String(raw || '').replace(/\[[0-9;]*m/g, '');
+  const tools = [];
+  for (const line of clean.split('\n')) {
+    const match = line.match(/^\s*(✓|✗)\s+(enabled|disabled)\s+(\S+)\s+(.+)$/);
+    if (match) tools.push({ name: match[3], label: match[4].trim(), enabled: match[2] === 'enabled' });
+  }
+  return tools;
 }
 
 function runtimeLog(event, data = {}) { ensureData(); fs.appendFileSync(runtimeLogFile, `${new Date().toISOString()} ${event} ${JSON.stringify(data)}\n`); }
@@ -514,11 +591,49 @@ ipcMain.handle('assignment:ack', async (_, text) => {
   try {
     const { stdout } = await runProcessGroup(gymstantCliPath(), ['-z', prompt, '-t', ''], {
       cwd: gymstantWorkdir(), timeout: 30000,
-      env: { ...process.env, PATH: process.platform === 'win32' ? process.env.PATH : `/Users/stewartos/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}` }
+      env: hermesEnv()
     });
     return { text: stdout.replace(/\u001b\[[0-9;]*m/g, '').trim(), model: 'Hermes · task handoff' };
   } catch {
     return { text: 'I understand the assignment. I’ll move aside while I work and stop before any consequential final action.', model: 'Gymstant fallback' };
+  }
+});
+ipcMain.handle('hermes:get-model', () => ({ model: readHermesModelConfig() }));
+ipcMain.handle('hermes:list-models', () => readHermesModelCatalog());
+ipcMain.handle('hermes:set-model', async (_, id) => {
+  const modelId = String(id || '').trim();
+  if (!modelId) return { ok: false, message: 'No model id provided.' };
+  try {
+    await runQuickProcess(gymstantCliPath(), ['config', 'set', 'model.provider', 'openrouter'], { cwd: gymstantWorkdir(), timeout: 20000, env: hermesEnv() });
+    await runQuickProcess(gymstantCliPath(), ['config', 'set', 'model.default', modelId], { cwd: gymstantWorkdir(), timeout: 20000, env: hermesEnv() });
+    runtimeLog('hermes.model-set', { model: modelId });
+    return { ok: true, model: readHermesModelConfig() };
+  } catch (error) {
+    runtimeLog('hermes.model-set-failed', { model: modelId, message: String(error.message || error).slice(0, 200) });
+    return { ok: false, message: String(error.message || error).slice(0, 200) };
+  }
+});
+ipcMain.handle('hermes:list-tools', async () => {
+  try {
+    const { stdout } = await runQuickProcess(gymstantCliPath(), ['tools', 'list'], { cwd: gymstantWorkdir(), timeout: 20000, env: hermesEnv() });
+    return { tools: parseHermesToolsList(stdout) };
+  } catch (error) {
+    return { tools: [], error: String(error.message || error).slice(0, 200) };
+  }
+});
+ipcMain.handle('hermes:set-tool', async (_, name, enabled) => {
+  const toolName = String(name || '').trim();
+  if (!toolName) return { ok: false, message: 'No tool name provided.' };
+  try {
+    await runQuickProcess(gymstantCliPath(), ['tools', enabled ? 'enable' : 'disable', toolName], { cwd: gymstantWorkdir(), timeout: 20000, env: hermesEnv() });
+    const { stdout } = await runQuickProcess(gymstantCliPath(), ['tools', 'list'], { cwd: gymstantWorkdir(), timeout: 20000, env: hermesEnv() });
+    runtimeLog('hermes.tool-set', { tool: toolName, enabled: Boolean(enabled) });
+    return { ok: true, tools: parseHermesToolsList(stdout) };
+  } catch (error) {
+    const raw = String(error.message || error);
+    const message = raw.includes('interactive terminal') ? "Toggling tools isn't supported without an interactive terminal in this Hermes version." : raw.slice(0, 200);
+    runtimeLog('hermes.tool-set-failed', { tool: toolName, message });
+    return { ok: false, message };
   }
 });
 ipcMain.handle('chat:load', () => {
@@ -675,7 +790,7 @@ ipcMain.handle('local:chat', async (_, payload) => {
       const prompt = `${identity}\n\n${demoMemory}\n\nYou are Gymstant's desktop operator. Execute ONLY the current stage below; never redo completed stages. Use computer_use, take the shortest reliable path, and visibly verify the result. Do not narrate routine clicks. Stop before send, submit, purchase, delete, publish, money movement, credentials, or any consequential final confirmation. A negative instruction like "do not send" means prepare the work and stop immediately before that action. Return a compact factual result under 180 words containing the exact facts the next stage needs. Never report success if the visible result is not verified. ${learnedHint}\n\nORIGINAL REQUEST: ${task.request}\n\nCOMPLETED STAGES:\n${taskRuntime.summary(task) || 'None'}\n\nCURRENT STAGE (${step.id}): ${step.label}`;
       const { stdout } = await runProcessGroup(gymstantCliPath(), ['-z', prompt, '-t', 'computer_use'], {
         cwd: gymstantWorkdir(), timeout: 120000, progressTimeout: 95000, focusAware: true, maxBuffer: 1024 * 1024,
-        env: { ...process.env, PATH: process.platform === 'win32' ? process.env.PATH : `/Users/stewartos/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}` }
+        env: hermesEnv()
       });
       const stepResult = stdout.replace(/\u001b\[[0-9;]*m/g, '').trim();
       if (!stepResult || isFalseSuccess(stepResult)) throw Object.assign(new Error(stepResult || 'Hermes returned no verified result.'), { code: 'EFALSUCCESS' });

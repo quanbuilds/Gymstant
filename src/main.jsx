@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, Archive, ArrowUp, CalendarDays, Check, ChevronDown, Eye, FileCheck2, FolderOpen, GraduationCap, GripVertical, History, Mic, Minimize2, MonitorCheck, Pause, Play, Plus, Settings, ShieldCheck, SlidersHorizontal, Sparkles, X } from 'lucide-react';
+import { Activity, Archive, ArrowUp, CalendarDays, Check, ChevronDown, Cpu, Eye, FileCheck2, FolderOpen, GraduationCap, GripVertical, History, Mic, Minimize2, MonitorCheck, Pause, Play, Plus, Settings, ShieldCheck, SlidersHorizontal, Sparkles, X } from 'lucide-react';
 const normalizeWatchCommand = text => /^\/?watch this\s*[.!]?$/i.test(String(text || '').trim());
 import './workflow.css';
 import './styles.css';
@@ -33,6 +33,11 @@ function App() {
   const [viewportWidth, setViewportWidth] = useState(window.innerWidth);
   const [historyItems, setHistoryItems] = useState([]);
   const [pendingSchedule, setPendingSchedule] = useState(null);
+  const [hermesModel, setHermesModelState] = useState(null);
+  const [hermesTools, setHermesToolsState] = useState([]);
+  const [modelCatalog, setModelCatalog] = useState({ available: false, models: [] });
+  const [hermesLoading, setHermesLoading] = useState(false);
+  const [hermesError, setHermesError] = useState('');
   const api = window.gymstant;
   const stateRef = useRef(state);
   const loadedRef = useRef(false);
@@ -69,6 +74,7 @@ function App() {
     });
   }); }, []);
   useEffect(() => { api?.loadTranscript().then(items => items?.length && setMessages(items)); }, []);
+  useEffect(() => { refreshHermesSettings(); }, []);
   useEffect(() => { const update = () => setViewportWidth(window.innerWidth); window.addEventListener('resize', update); return () => window.removeEventListener('resize', update); }, []);
   useEffect(() => {
     const bar = document.querySelector('.chatbar'); if (!bar) return;
@@ -102,6 +108,26 @@ function App() {
     setPanelVisible(false); setTimeout(() => setExpanded(false), 280);
   }
   async function refreshHistory() { setHistoryItems(await api?.listHistory() || []); }
+  async function refreshHermesSettings() {
+    setHermesLoading(true); setHermesError('');
+    try {
+      const [modelResult, toolsResult, catalogResult] = await Promise.all([api?.hermesGetModel(), api?.hermesListTools(), api?.hermesListModels()]);
+      setHermesModelState(modelResult?.model || null);
+      setHermesToolsState(toolsResult?.tools || []);
+      setModelCatalog(catalogResult || { available: false, models: [] });
+    } catch { setHermesError('Could not reach Hermes.'); }
+    finally { setHermesLoading(false); }
+  }
+  async function setHermesModel(id) {
+    const result = await api?.hermesSetModel(id);
+    if (result?.ok) setHermesModelState(result.model);
+    return result || { ok: false, message: 'No response from Hermes.' };
+  }
+  async function setHermesTool(name, enabled) {
+    const result = await api?.hermesSetTool(name, enabled);
+    if (result?.ok) setHermesToolsState(result.tools);
+    return result || { ok: false, message: 'No response from Hermes.' };
+  }
   async function newSession() { await api?.archiveConversation(); setMessages([]); setThinking(false); setState(s=>({...s,activeLane:'learn'})); setToast('New session'); await refreshHistory(); openPanel(); }
   async function interruptExecution() { setToast('Stopping safely…'); await api?.executionCancel(); }
   async function showExecution() { await api?.executionPeek(); setExecutionOpen(true); setPanelVisible(true); }
@@ -146,6 +172,60 @@ function App() {
       setState(s=>({...s,settings:{...s.settings,focusResumeSeconds:seconds,focusPrompted:true}}));
       setMessages(items=>[...items,{role:'user',content:text},{role:'assistant',content:`Done. I’ll resume after ${seconds} seconds of inactivity.`,model:'Gymstant · settings'}]);
       setMessage(''); openPanel(); return;
+    }
+    const modelCommand = text.match(/^\/model\b\s*(.*)$/i);
+    const modelPhrase = !modelCommand && text.match(/\b(?:switch|change)\b(?:\s+(?:the\s+)?models?)?\s+to\s+(.+?)[.!]?$/i);
+    const modelUseIntent = !modelCommand && !modelPhrase && modelCatalog.available && text.match(/^use\s+(.{2,40})$/i);
+    const modelQuery = (modelCommand?.[1] || modelPhrase?.[1] || modelUseIntent?.[1] || '').trim();
+    const modelStrongSignal = Boolean(modelCommand || modelPhrase);
+    const modelResolved = modelQuery ? resolveMatch(modelQuery, modelCatalog.models, 'id', ['name']) : null;
+    if (modelCommand && !modelQuery) {
+      setMessages(items => [...items, {role:'user',content:text}, {role:'assistant',content: hermesModel?.default ? `The current model is ${hermesModel.default} (provider: ${hermesModel.provider}). Say "switch to <name>" or open Settings to change it.` : 'I could not read the current Hermes model configuration. Open Settings to check it.', model:'Gymstant · settings'}]);
+      setMessage(''); openPanel(); return;
+    }
+    if (modelStrongSignal || (modelResolved && modelResolved.status === 'found')) {
+      setMessage('');
+      if (!modelResolved || modelResolved.status === 'none') {
+        setMessages(items => [...items, {role:'user',content:text}, {role:'assistant',content: `I couldn't find a model matching "${modelQuery}" in the local catalog. Open Settings to browse available models.`, model:'Gymstant · settings'}]);
+        openPanel(); return;
+      }
+      if (modelResolved.status === 'ambiguous') {
+        setMessages(items => [...items, {role:'user',content:text}, {role:'assistant',content: `"${modelQuery}" matches more than one model — ${modelResolved.options.map(o=>o.name).join(', ')}. Which one did you mean?`, model:'Gymstant · settings'}]);
+        openPanel(); return;
+      }
+      setMessages(items => [...items, {role:'user',content:text}, {role:'assistant',content: `Switching the model to ${modelResolved.item.name}…`, model:'Gymstant · settings'}]);
+      openPanel();
+      const modelResult = await setHermesModel(modelResolved.item.id);
+      setMessages(items => [...items, {role:'assistant',content: modelResult.ok ? `Done. Gymstant now uses ${modelResolved.item.name}.` : `I could not switch the model: ${modelResult.message}`, model:'Gymstant · settings'}]);
+      return;
+    }
+    const toolsListCommand = /^\/tools\b\s*$/i.test(text);
+    if (toolsListCommand) {
+      setMessage('');
+      const summary = hermesTools.length ? hermesTools.map(t => `${t.name}${t.enabled?'':' (off)'}`).join(', ') : 'not available yet';
+      setMessages(items => [...items, {role:'user',content:text}, {role:'assistant',content: `Tools: ${summary}. Open Settings to change any of them.`, model:'Gymstant · settings'}]);
+      openPanel(); return;
+    }
+    const toolCommand = text.match(/^\/tool\s+(enable|disable)\s+(.+)$/i);
+    const toolPhraseMatch = !toolCommand && text.match(/\b(turn\s+on|turn\s+off|enable|disable)\b\s+(.+?)[.!]?$/i);
+    const toolQuery = (toolCommand?.[2] || toolPhraseMatch?.[2] || '').trim();
+    const toolEnable = toolCommand ? toolCommand[1].toLowerCase() === 'enable' : /^turn\s+on|^enable/i.test(toolPhraseMatch?.[1] || '');
+    const toolResolved = toolQuery ? resolveMatch(toolQuery, hermesTools, 'name', ['label']) : null;
+    if (toolCommand || (toolResolved && toolResolved.status === 'found')) {
+      setMessage('');
+      if (!toolResolved || toolResolved.status === 'none') {
+        setMessages(items => [...items, {role:'user',content:text}, {role:'assistant',content: `I couldn't find a tool matching "${toolQuery}." Say "/tools" to see the full list.`, model:'Gymstant · settings'}]);
+        openPanel(); return;
+      }
+      if (toolResolved.status === 'ambiguous') {
+        setMessages(items => [...items, {role:'user',content:text}, {role:'assistant',content: `"${toolQuery}" matches more than one tool — ${toolResolved.options.map(o=>o.label).join(', ')}. Which one did you mean?`, model:'Gymstant · settings'}]);
+        openPanel(); return;
+      }
+      setMessages(items => [...items, {role:'user',content:text}, {role:'assistant',content: `${toolEnable ? 'Enabling' : 'Disabling'} ${toolResolved.item.label}…`, model:'Gymstant · settings'}]);
+      openPanel();
+      const toolResult = await setHermesTool(toolResolved.item.name, toolEnable);
+      setMessages(items => [...items, {role:'assistant',content: toolResult.ok ? `Done. ${toolResolved.item.label} is now ${toolEnable?'enabled':'disabled'}.` : `I could not change that tool: ${toolResult.message}`, model:'Gymstant · settings'}]);
+      return;
     }
     const verifiedTuesdayQuestion = /(?:what|explain|detail)[\s\S]{0,100}(?:verify|steps)[\s\S]{0,100}(?:choosing|choose|tuesday)|(?:verify|steps)[\s\S]{0,100}tuesday/i.test(text);
     if (verifiedTuesdayQuestion) {
@@ -298,7 +378,9 @@ function App() {
         <button className="settings-tab" title="Settings" onClick={()=>setState(s=>({...s,activeLane:'settings'}))}><SlidersHorizontal/></button>
       </nav><button className="close-pill glass" onClick={closePanel}><X size={15}/></button></div>
       <div className="content module">{state.activeLane === 'settings'
-        ? <SettingsPanel settings={state.settings || seed.settings} update={settings=>setState(s=>({...s,settings:{...s.settings,...settings}}))}/>
+        ? <SettingsPanel settings={state.settings || seed.settings} update={settings=>setState(s=>({...s,settings:{...s.settings,...settings}}))}
+            hermesModel={hermesModel} hermesTools={hermesTools} modelCatalog={modelCatalog} hermesLoading={hermesLoading} hermesError={hermesError}
+            onSetModel={setHermesModel} onSetTool={setHermesTool}/>
         : state.activeLane === 'history'
         ? <HistoryPanel items={historyItems} archive={async()=>{await api?.archiveConversation();setMessages([]);await refreshHistory();}} open={async id=>{setMessages(await api?.openConversation(id)||[]);setState(s=>({...s,activeLane:'learn'}));}}/>
         : state.activeLane === 'learn' && messages.length > 0
@@ -325,7 +407,39 @@ function Learn({state,setState,start,capture,finish}) {
 }
 function Queue({items,action,remove,label,empty,monitor}) { return items.length===0?<div className="empty compact"><Check/><h2>{empty}</h2></div>:<div className="queue">{items.map(w=><article key={w.id}><div className="appmark">{w.app?.[0]||'W'}</div><div className="details"><b>{w.title}</b><span>{w.detail || `${w.app} · ${typeof w.steps==='number'?w.steps:w.steps.length} steps · ${w.confidence}% confidence`}</span></div><span className={monitor?'badge amber':'badge'}>{monitor?'Awaiting final click':'Ready to review'}</span><div className="queue-actions"><button className="remove-workflow" title={`Remove ${w.title}`} aria-label={`Remove ${w.title}`} onClick={()=>remove(w)}><X size={15}/>Remove</button><button className="action" onClick={()=>action(monitor?w:w.id)}>{label}<ArrowUp/></button></div></article>)}</div> }
 function HistoryPanel({items,archive,open}) { return <div className="history-list">{items.length===0?<div className="empty compact"><History/><h2>No saved conversations</h2></div>:items.map(item=><article key={item.id} className="history-item glass"><button className="history-open" onClick={()=>open(item.id)}><b>{item.title}</b><span>{item.count} messages · {item.archived?'Archived':'Current'}</span></button>{!item.archived&&<button className="archive-button" title="Archive conversation" onClick={archive}><Archive/></button>}</article>)}</div> }
-function SettingsPanel({settings,update}) { return <div className="settings-panel"><div className="settings-card glass"><span className="hero-icon small"><Settings/></span><div><h2>Interruption recovery</h2><p>When you use another app, Gymstant pauses. After this much inactivity it returns to its work.</p></div><label><b>{settings.focusResumeSeconds} seconds</b><input type="range" min="5" max="120" step="5" value={settings.focusResumeSeconds} onChange={e=>update({focusResumeSeconds:Number(e.target.value)})}/><small>Ask Gymstant to change this anytime.</small></label></div><div className="personalization-card glass"><div><Sparkles/><span><b>Workflow capture</b><small>Keep proprietary data out of evidence.</small></span></div><label className="setting-select"><span>Screenshot privacy</span><select value={settings.capturePrivacy} onChange={e=>update({capturePrivacy:e.target.value})}><option value="pixelated">Pixelate sensitive content</option><option value="local">Keep local screenshot unchanged</option></select></label><label className="setting-toggle"><input type="checkbox" checked={Boolean(settings.captureNotes)} onChange={e=>update({captureNotes:e.target.checked})}/><span>Prompt me to annotate each captured step</span></label><label className="setting-toggle"><input type="checkbox" checked={Boolean(settings.showCaptureHints)} onChange={e=>update({showCaptureHints:e.target.checked})}/><span>Show capture and shortcut hints</span></label><label className="setting-select"><span>Assistant voice</span><select value={settings.assistantTone} onChange={e=>update({assistantTone:e.target.value})}><option value="concise">Concise</option><option value="coaching">Coaching</option><option value="detailed">Detailed</option></select></label></div></div> }
+function SettingsPanel({settings,update,hermesModel,hermesTools,modelCatalog,hermesLoading,hermesError,onSetModel,onSetTool}) {
+  const [pendingTool, setPendingTool] = useState(null);
+  const [toolError, setToolError] = useState('');
+  async function toggleTool(tool, checked) {
+    setPendingTool(tool.name); setToolError('');
+    const result = await onSetTool(tool.name, checked);
+    setPendingTool(null);
+    if (!result.ok) setToolError(`Could not change ${tool.label}: ${result.message}`);
+  }
+  const catalogNote = { 'no-profile': "Hermes hasn't been set up on this computer yet.", 'not-cached': 'The model catalog isn’t cached yet. Run “hermes model” once in a terminal, then reopen Settings.', 'unreadable': 'The model catalog file could not be read.' }[modelCatalog.reason] || 'Model catalog isn’t available yet.';
+  return <div className="settings-panel"><div className="settings-card glass"><span className="hero-icon small"><Settings/></span><div><h2>Interruption recovery</h2><p>When you use another app, Gymstant pauses. After this much inactivity it returns to its work.</p></div><label><b>{settings.focusResumeSeconds} seconds</b><input type="range" min="5" max="120" step="5" value={settings.focusResumeSeconds} onChange={e=>update({focusResumeSeconds:Number(e.target.value)})}/><small>Ask Gymstant to change this anytime.</small></label></div><div className="personalization-card glass"><div><Sparkles/><span><b>Workflow capture</b><small>Keep proprietary data out of evidence.</small></span></div><label className="setting-select"><span>Screenshot privacy</span><select value={settings.capturePrivacy} onChange={e=>update({capturePrivacy:e.target.value})}><option value="pixelated">Pixelate sensitive content</option><option value="local">Keep local screenshot unchanged</option></select></label><label className="setting-toggle"><input type="checkbox" checked={Boolean(settings.captureNotes)} onChange={e=>update({captureNotes:e.target.checked})}/><span>Prompt me to annotate each captured step</span></label><label className="setting-toggle"><input type="checkbox" checked={Boolean(settings.showCaptureHints)} onChange={e=>update({showCaptureHints:e.target.checked})}/><span>Show capture and shortcut hints</span></label><label className="setting-select"><span>Assistant voice</span><select value={settings.assistantTone} onChange={e=>update({assistantTone:e.target.value})}><option value="concise">Concise</option><option value="coaching">Coaching</option><option value="detailed">Detailed</option></select></label></div>
+    <div className="personalization-card glass">
+      <div><Cpu/><span><b>AI &amp; Tools</b><small>Model and tool access for this Hermes agent.</small></span></div>
+      {hermesLoading && <small>Loading Hermes settings…</small>}
+      {hermesError && <small>{hermesError}</small>}
+      <label className="setting-select">
+        <span>Current model</span>
+        {modelCatalog.available
+          ? <select value={hermesModel?.default || ''} onChange={e=>onSetModel(e.target.value)} disabled={hermesLoading}>
+              {!modelCatalog.models.some(m=>m.id===hermesModel?.default) && hermesModel?.default && <option value={hermesModel.default}>{hermesModel.default}</option>}
+              {modelCatalog.models.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          : <small>{catalogNote}{hermesModel?.default ? ` Current: ${hermesModel.default} (${hermesModel.provider}).` : ''}</small>}
+      </label>
+      {toolError && <small>{toolError}</small>}
+      {hermesTools.map(tool => (
+        <label className="setting-toggle" key={tool.name}>
+          <input type="checkbox" checked={tool.enabled} disabled={pendingTool===tool.name} onChange={e=>toggleTool(tool, e.target.checked)}/>
+          <span>{tool.label}{pendingTool===tool.name ? ' …' : ''}</span>
+        </label>
+      ))}
+    </div>
+  </div> }
 
 function ExecutionStatusCard({run,onFix,onStop}) {
   const progress = run.checkpointCount ? Math.max(4, Math.min(100, ((run.checkpointIndex || 0) / run.checkpointCount) * 100)) : run.status === 'complete' ? 100 : 18;
@@ -345,6 +459,24 @@ function parseSchedule(text) {
   const suffix = match?.[3]?.toLowerCase(); if (suffix === 'pm' && hour < 12) hour += 12; if (suffix === 'am' && hour === 12) hour = 0;
   const cadence = /weekdays?/i.test(text) ? 'weekdays' : /weekly|each week/i.test(text) ? 'weekly' : 'daily';
   return { hour, minute, cadence };
+}
+function fuzzyPick(query, items, idKey, nameKeys) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return [];
+  return items.map(item => {
+    const id = String(item[idKey] || '').toLowerCase();
+    const names = nameKeys.map(k => String(item[k] || '').toLowerCase());
+    if (id === q || names.includes(q)) return { item, score: 0, length: id.length };
+    const hit = id.includes(q) || names.some(n => n.includes(q));
+    return hit ? { item, score: 1, length: Math.min(id.length, ...names.map(n => n.length || 999)) } : null;
+  }).filter(Boolean).sort((a, b) => a.score - b.score || a.length - b.length);
+}
+function resolveMatch(query, items, idKey, nameKeys) {
+  const scored = fuzzyPick(query, items, idKey, nameKeys);
+  if (!scored.length) return { status: 'none' };
+  if (scored.length === 1 || scored[0].score < scored[1].score) return { status: 'found', item: scored[0].item };
+  if (scored[1].length > scored[0].length) return { status: 'found', item: scored[0].item };
+  return { status: 'ambiguous', options: scored.filter(s => s.score === scored[0].score).slice(0, 5).map(s => s.item) };
 }
 function workflowTitle(context='') {
   if (/makeup|missed[- ]class|absence/i.test(context)) return 'Gymstant: Review missed-class requests';
