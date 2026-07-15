@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Gymstant Harness</title></head>
+<body>
+<div id="root"></div>
+<script>
+  // Mock the Electron preload bridge so the renderer runs in a plain browser.
+  window.__saved = null;
+  window.__saveCount = 0;
+  window.__loadState = null; // set via ?load=<uri-encoded JSON> or localStorage gymtest-load
+  try {
+    const q = new URLSearchParams(location.search).get('load');
+    window.__loadState = q ? JSON.parse(decodeURIComponent(q)) : JSON.parse(localStorage.getItem('gymtest-load') || 'null');
+  } catch {}
+  const noop = async () => undefined;
+  window.gymstant = {
+    load: async () => window.__loadState,
+    save: async (s) => { window.__saved = s; window.__saveCount++; localStorage.setItem('gymtest-saved', JSON.stringify(s)); return true; },
+    capture: async (label) => ({ path: '/tmp/fake-' + label + '.png', dataUrl: null, capturedAt: new Date().toISOString() }),
+    completeTeaching: noop, approveLearnedWorkflow: noop,
+    executeMonitorAction: async (id) => ({ ok: true, text: 'MOCK: executed ' + id }),
+    askLocal: async (messages, options) => ({ text: 'MOCK reply', model: 'mock' }),
+    assignmentAck: async () => ({ text: 'MOCK ack', model: 'mock' }),
+    executionBegin: noop, executionPeek: noop, executionHide: noop, executionEnd: noop, executionCancel: noop,
+    setFocusResumeSeconds: noop, calendarOptions: async () => [], scheduleCalendar: async () => ({ ok: false }),
+    loadTranscript: async () => [], listHistory: async () => [], archiveConversation: noop, openConversation: async () => [],
+    openData: noop, resize: noop, dragStart: noop, dragMove: noop, dragEnd: noop,
+    heightResizeStart: noop, heightResizeMove: noop, heightResizeEnd: noop,
+    resizeStart: noop, resizeMove: noop, resizeEnd: noop, contentHeight: noop, setChatbarHeight: noop,
+    refreshLens: noop, onLens: noop, onPlacement: noop, onCollapsed: noop,
+    onExecutionActivity: noop, onFocusResume: noop, onShortcutCapture: (cb) => { window.__shortcut = cb; }
+  };
+</script>
+<script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
