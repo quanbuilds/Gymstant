@@ -68,7 +68,17 @@ function hermesProfileDir() {
   return process.platform === 'darwin' ? path.join(home, 'profiles', 'gymstant') : home;
 }
 function hermesEnv() {
-  return { ...process.env, PATH: process.platform === 'win32' ? process.env.PATH : `/Users/stewartos/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}` };
+  if (process.platform === 'win32') {
+    const userHome = os.homedir();
+    const extraPaths = [
+      path.join(userHome, 'AppData', 'Local', 'Programs', 'Hermes'),
+      path.join(userHome, 'AppData', 'Local', 'Programs', 'Hermes', 'bin'),
+      path.join(userHome, 'go', 'bin'),
+      'C:\\Program Files\\Hermes\\bin'
+    ];
+    return { ...process.env, PATH: `${extraPaths.join(';')};${process.env.PATH || ''}` };
+  }
+  return { ...process.env, PATH: `/Users/stewartos/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}` };
 }
 // Lightweight sibling to runProcessGroup for short, non-cancelable, non-focus-aware
 // CLI calls (settings reads/writes). Deliberately does not touch activeExecution —
@@ -789,7 +799,7 @@ ipcMain.handle('local:chat', async (_, payload) => {
       runtimeLog('task.step-start', { task_id: task.id, step: step.id, attempt: step.attempts });
       const prompt = `${identity}\n\n${demoMemory}\n\nYou are Gymstant's desktop operator. Execute ONLY the current stage below; never redo completed stages. Use computer_use, take the shortest reliable path, and visibly verify the result. Do not narrate routine clicks. Stop before send, submit, purchase, delete, publish, money movement, credentials, or any consequential final confirmation. A negative instruction like "do not send" means prepare the work and stop immediately before that action. Return a compact factual result under 180 words containing the exact facts the next stage needs. Never report success if the visible result is not verified. ${learnedHint}\n\nORIGINAL REQUEST: ${task.request}\n\nCOMPLETED STAGES:\n${taskRuntime.summary(task) || 'None'}\n\nCURRENT STAGE (${step.id}): ${step.label}`;
       const { stdout } = await runProcessGroup(gymstantCliPath(), ['-z', prompt, '-t', 'computer_use'], {
-        cwd: gymstantWorkdir(), timeout: 120000, progressTimeout: 95000, focusAware: true, maxBuffer: 1024 * 1024,
+        cwd: gymstantWorkdir(), timeout: 120000, progressTimeout: 110000, focusAware: true, maxBuffer: 1024 * 1024,
         env: hermesEnv()
       });
       const stepResult = stdout.replace(/\u001b\[[0-9;]*m/g, '').trim();
