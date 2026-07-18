@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildWorkflowManual, buildWorkflowRetirement, normalizeWatchCommand, nextWindowMode } = require('../electron/workflow-utils.cjs');
+const { buildWorkflowManual, buildWorkflowRetirement, buildReplayPlan, normalizeWatchCommand, nextWindowMode } = require('../electron/workflow-utils.cjs');
 
 test('recognizes the watch-this command without treating ordinary messages as commands', () => {
   assert.equal(normalizeWatchCommand('watch this'), true);
@@ -39,4 +39,24 @@ test('records an auditable retirement note when an incorrect workflow is removed
   assert.match(note, /Retired workflow: Old parent follow-up/);
   assert.match(note, /ID: wf-old/);
   assert.match(note, /must not be used for future automation/i);
+});
+
+test('turns observed notes into a structured replay plan with safety boundaries', () => {
+  const plan = buildReplayPlan({ steps: [
+    { label: 'Open the roster', note: 'Navigate to the Tuesday class.' },
+    { label: 'Prepare the message', note: 'Do not send until a person confirms.' }
+  ] });
+  assert.equal(plan[0].action, 'navigate');
+  assert.equal(plan[1].action, 'input');
+  assert.equal(plan[1].risk, 'consequential-stop');
+  assert.match(buildWorkflowManual({ steps: [{ label:'Open roster', note:'Check the class.' }] }), /## Replay plan/);
+});
+
+test('preserves a deterministic event trace without exposing typed text', () => {
+  const manual = buildWorkflowManual({ title:'Roster review', events:[
+    { type:'mouse.click' }, { type:'key.press', textRedacted:true }, { type:'window.activate' }
+  ], eventTraceVersion:1, steps:[] });
+  assert.match(manual, /Deterministic event trace/);
+  assert.match(manual, /3 \(1 clicks, 1 key presses, 1 window transitions\)/);
+  assert.match(manual, /typed text omitted/i);
 });

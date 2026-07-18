@@ -1,13 +1,15 @@
-const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, shell, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, shell, powerMonitor, dialog } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const { spawn } = require('child_process');
 const zlib = require('zlib');
 const http = require('http');
 const os = require('os');
+const sharp = require('sharp');
 const { TaskRuntime, originalRequest, isFalseSuccess } = require('./task-runtime.cjs');
 const { SpeedLayer, runSeededDemoFastPath } = require('./speed-layer.cjs');
-const { buildWorkflowManual, buildWorkflowRetirement, nextWindowMode } = require('./workflow-utils.cjs');
+const { buildWorkflowManual, buildWorkflowRetirement, buildReplayPlan, nextWindowMode } = require('./workflow-utils.cjs');
 
 const isDev = !app.isPackaged;
 let win;
@@ -25,9 +27,16 @@ let nativeGlass;
 let focusResumeSeconds = 15;
 let memoryServer;
 let nativeChatbarHeight = 56;
+let eventRecorder;
+let activeEventTrace = [];
+let eventRecordingError = null;
+let eventRecorderPoller;
+let eventRecorderFile;
+let eventEnrichmentBusy = false;
 const managedApps = new Set();
 const collapsedSize = { width: 590, height: 108 };
 const minimizedSize = { width: 108, height: 108 };
+const executionPillSize = { width: 240, height: 56 };
 const expandedSize = { width: 660, height: 560 };
 let collapsedHeight = collapsedSize.height;
 let windowMode = 'chatbar';
@@ -69,6 +78,158 @@ function hermesProfileDir() {
 }
 function hermesEnv() {
   return { ...process.env, PATH: process.platform === 'win32' ? process.env.PATH : `/Users/stewartos/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}` };
+}
+
+function eventRecorderPath() {
+  const candidates = [
+    path.join(process.resourcesPath || '', 'app.asar.unpacked', 'electron', 'native', 'workflow-event-recorder'),
+    path.join(process.resourcesPath || '', 'app.asar.unpacked', 'electron', 'native', 'Gymstant Event Recorder.app', 'Contents', 'MacOS', 'workflow-event-recorder'),
+    path.join(__dirname, 'native', 'workflow-event-recorder'),
+    path.join(__dirname, 'native', 'Gymstant Event Recorder.app', 'Contents', 'MacOS', 'workflow-event-recorder')
+  ];
+  return candidates.find(candidate => candidate && !candidate.includes(`${path.sep}app.asar${path.sep}`) && fs.existsSync(candidate)) || null;
+}
+function eventRecorderAppPath() {
+  const candidates = [
+    path.join(process.resourcesPath || '', 'app.asar.unpacked', 'electron', 'native', 'Gymstant Event Recorder.app'),
+    path.join(__dirname, 'native', 'Gymstant Event Recorder.app')
+  ];
+  return candidates.find(candidate => candidate && fs.existsSync(path.join(candidate, 'Contents', 'MacOS', 'workflow-event-recorder'))) || null;
+}
+function killEventRecorderProcesses() {
+  const appBundle = eventRecorderAppPath();
+  const binary = eventRecorderPath();
+  const target = appBundle ? path.join(appBundle, 'Contents', 'MacOS', 'workflow-event-recorder') : binary;
+  if (target) { try { spawn('/usr/bin/pkill', ['-f', target], { stdio:'ignore' }); } catch {} }
+  if (eventRecorder && !eventRecorder.killed) { try { eventRecorder.kill('SIGTERM'); } catch {} }
+  eventRecorder = null;
+}
+async function enrichEventTarget(event) {
+  if (!event || event.type !== 'mouse.click' || event.elementTitle || event.elementDescription || event.elementHelp || event.visibleTarget) return event;
+  if (!Number.isFinite(Number(event.x)) || !Number.isFinite(Number(event.y))) return event;
+  if (eventEnrichmentBusy) return event;
+  eventEnrichmentBusy = true;
+  try {
+    const point = { x:Number(event.x), y:Number(event.y) };
+    const display = screen.getDisplayMatching(point);
+    const sources = await desktopCapturer.getSources({ types:['screen'], thumbnailSize:display.size });
+    const source = sources.find(item => item.display_id === String(display.id)) || sources[0];
+    if (!source || source.thumbnail.isEmpty()) return event;
+    const png = source.thumbnail.toPNG();
+    const imageSize = source.thumbnail.getSize();
+    const scaleX = imageSize.width / Math.max(1, display.size.width);
+    const scaleY = imageSize.height / Math.max(1, display.size.height);
+    const clickX = (point.x - display.bounds.x) * scaleX;
+    const clickY = (point.y - display.bounds.y) * scaleY;
+    const binary = process.platform === 'darwin' && fs.existsSync('/opt/homebrew/bin/tesseract') ? '/opt/homebrew/bin/tesseract' : null;
+    if (!binary) return event;
+    const words = await new Promise(resolve => {
+      const child = spawn(binary, ['stdin','stdout','-l','eng','--psm','11','tsv'], { stdio:['pipe','pipe','ignore'] });
+      let stdout = '', timer;
+      const finish = value => { if (timer) clearTimeout(timer); resolve(value); };
+      child.stdout.on('data', chunk => { stdout += chunk; });
+      child.on('error', () => finish([]));
+      child.on('close', () => {
+        const rows = [];
+        for (const row of stdout.split(/\r?\n/).slice(1)) {
+          const c = row.split('\t'); if (c.length < 12 || c[0] !== '5') continue;
+          const [left, top, width, height, confidence] = [6,7,8,9,10].map(i => Number(c[i]));
+          const text = c.slice(11).join('\t').trim();
+          if (!text || confidence < 25 || ![left,top,width,height].every(Number.isFinite)) continue;
+          rows.push({ text, left, top, right:left + width, bottom:top + height, cx:left + width / 2, cy:top + height / 2 });
+        }
+        finish(rows);
+      });
+      timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch {} finish([]); }, 2500);
+      child.stdin.end(png);
+    });
+    const nearby = words.filter(word => Math.hypot(word.cx - clickX, word.cy - clickY) < 260 * Math.max(scaleX, scaleY));
+    nearby.sort((a,b) => Math.hypot(a.cx-clickX,a.cy-clickY) - Math.hypot(b.cx-clickX,b.cy-clickY));
+    const candidate = nearby[0];
+    if (!candidate) return event;
+    const sensitive = /@|\b\d{3}[-. )]\d{3}[-. ]\d{4}\b|\b(?:email address|mobile number|phone number)\b/i;
+    const label = candidate.text.replace(/[^\w &'’/-]/g, '').trim();
+    if (!label || sensitive.test(label)) return event;
+    return { ...event, visibleTarget:label, visibleTargetSource:'local-ocr', visibleTargetConfidence:'screen-near-click' };
+  } finally { eventEnrichmentBusy = false; }
+}
+async function syncEventRecorderFile() {
+  if (!eventRecorderFile || !fs.existsSync(eventRecorderFile)) return;
+  const events = fs.readFileSync(eventRecorderFile, 'utf8').split(/\r?\n/).filter(Boolean).flatMap(line => { try { const event = JSON.parse(line); return event?.type ? [event] : []; } catch { return []; } });
+  const current = dedupeEventTrace(events);
+  const enriched = [];
+  for (const event of current) {
+    const key = [event.type,event.at,event.x,event.y].join('|');
+    const known = activeEventTrace.find(item => [item.type,item.at,item.x,item.y].join('|') === key);
+    if (known?.visibleTarget || event.type !== 'mouse.click') enriched.push(known || event);
+    else enriched.push(await enrichEventTarget(event));
+  }
+  activeEventTrace = enriched;
+}
+function dedupeEventTrace(events = []) {
+  const seen = new Set();
+  return events.filter(event => {
+    const key = [event.type, event.at, event.x, event.y, event.keyCode, event.app, event.windowTitle].join('|');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+async function startWorkflowEventRecording() {
+  await stopWorkflowEventRecording();
+  activeEventTrace = [];
+  eventRecordingError = null;
+  if (process.platform !== 'darwin') return { ok: false, reason: 'Deterministic event recording is currently macOS-only.' };
+  const appBundle = eventRecorderAppPath();
+  const binary = eventRecorderPath();
+  if (!binary) return { ok: false, reason: 'The macOS event recorder is not installed.' };
+  try {
+    eventRecorderFile = path.join(os.tmpdir(), `gymstant-events-${process.pid}.jsonl`);
+    try { fs.unlinkSync(eventRecorderFile); } catch {}
+    // Execute the recorder directly: LaunchServices exits immediately after
+    // handing off an LSUIElement app and makes the tap lifecycle unreliable.
+    // The nested executable is stably signed with the recorder bundle's
+    // development identity; the JSONL file remains the single event source.
+    eventRecorder = spawn(binary, ['--record-file', eventRecorderFile], { stdio: ['ignore', 'ignore', 'pipe'] });
+    // When --record-file is active, the file poller is the single source of
+    // truth. Reading stdout as well duplicates every event and can cause
+    // replay to run the same click sequence twice.
+    eventRecorder.stderr.on('data', chunk => { eventRecordingError = String(chunk).trim(); });
+    eventRecorder.on('error', error => { eventRecordingError = error.message; runtimeLog('workflow.events.error', { error: error.message }); eventRecorder = null; });
+    eventRecorder.on('close', (code, signal) => { runtimeLog('workflow.events.close', { code, signal, error: eventRecordingError || undefined }); });
+    eventRecorder.on('close', code => { if (code && !eventRecordingError) eventRecordingError = `Event recorder exited with code ${code}`; eventRecorder = null; });
+    if (appBundle) eventRecorderPoller = setInterval(syncEventRecorderFile, 120);
+    await new Promise(resolve => setTimeout(resolve, 220));
+    if (eventRecordingError) return { ok: false, reason: eventRecordingError };
+    runtimeLog('workflow.events.start', { binary });
+    return { ok: true, eventTraceVersion: 1, textPolicy: 'omitted' };
+  } catch (error) { eventRecordingError = error.message; return { ok: false, reason: error.message }; }
+}
+async function stopWorkflowEventRecording() {
+  if (eventRecorderPoller) { clearInterval(eventRecorderPoller); eventRecorderPoller = null; }
+  // Kill first. OCR enrichment can take a couple seconds and must never leave
+  // the native recorder alive while the user is trying to pause/restart.
+  killEventRecorderProcesses();
+  await syncEventRecorderFile();
+  const trace = activeEventTrace.slice();
+  runtimeLog('workflow.events.stop', { events: trace.length, error: eventRecordingError || undefined });
+  try { if (eventRecorderFile) fs.unlinkSync(eventRecorderFile); } catch {}
+  eventRecorderFile = null;
+  return { events: trace, error: eventRecordingError };
+}
+function replayWorkflowEvents(events, options = {}) {
+  return new Promise((resolve, reject) => {
+    const binary = eventRecorderPath();
+    if (!binary) return reject(new Error('The macOS event recorder is not installed.'));
+    const child = spawn(binary, ['--replay'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { stdout += String(chunk); });
+    child.stderr.on('data', chunk => { stderr += String(chunk); });
+    child.on('error', reject);
+    child.on('close', code => code === 0 ? resolve({ ok:true, events:events.length, output:stdout }) : reject(new Error(stderr.trim() || `Replay exited with code ${code}`)));
+    child.stdin.end(events.map(event => JSON.stringify(event)).join('\n'));
+    setTimeout(() => { try { child.kill('SIGTERM'); } catch {} }, options.timeout || 120000);
+  });
 }
 // Lightweight sibling to runProcessGroup for short, non-cancelable, non-focus-aware
 // CLI calls (settings reads/writes). Deliberately does not touch activeExecution —
@@ -179,7 +340,181 @@ function nativeGlassPath() {
     ? path.join(__dirname, 'native/GymstantGlassHost')
     : path.join(process.resourcesPath, 'app.asar.unpacked/electron/native/GymstantGlassHost');
 }
+function sensitiveScannerPath() {
+  return isDev
+    ? path.join(__dirname, 'native/scan-sensitive-ui.applescript')
+    : path.join(process.resourcesPath, 'app.asar.unpacked/electron/native/scan-sensitive-ui.applescript');
+}
+function mergeRedactionRegions(regions, width, height) {
+  const clamped = regions.map(region => ({
+    left: Math.max(0, Math.min(width - 1, Math.round(region.left))),
+    top: Math.max(0, Math.min(height - 1, Math.round(region.top))),
+    width: Math.max(1, Math.min(width - Math.max(0, Math.round(region.left)), Math.round(region.width))),
+    height: Math.max(1, Math.min(height - Math.max(0, Math.round(region.top)), Math.round(region.height)))
+  })).filter(region => region.width > 3 && region.height > 3);
+  const merged = [];
+  for (const region of clamped) {
+    const overlap = merged.find(item => !(region.left > item.left + item.width + 8 || region.left + region.width + 8 < item.left || region.top > item.top + item.height + 8 || region.top + region.height + 8 < item.top));
+    if (!overlap) merged.push({ ...region });
+    else {
+      const right = Math.max(overlap.left + overlap.width, region.left + region.width);
+      const bottom = Math.max(overlap.top + overlap.height, region.top + region.height);
+      overlap.left = Math.min(overlap.left, region.left);
+      overlap.top = Math.min(overlap.top, region.top);
+      overlap.width = right - overlap.left;
+      overlap.height = bottom - overlap.top;
+    }
+  }
+  return merged.slice(0, 80);
+}
+function scanSensitiveRegions(display) {
+  return new Promise(resolve => {
+    if (process.platform !== 'darwin') return resolve({ ok:false, reason:'Sensitive-region scanning is not available on this platform.' });
+    const file = sensitiveScannerPath();
+    if (!fs.existsSync(file)) return resolve({ ok:false, reason:'Sensitive-region scanner is missing.' });
+    const child = spawn('/usr/bin/osascript', [file], { stdio:['ignore','pipe','pipe'] });
+    let stdout = '', stderr = '', settled = false, timer;
+    const finish = result => { if (settled) return; settled = true; if (timer) clearTimeout(timer); resolve(result); };
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', error => finish({ ok:false, reason:error.message }));
+    child.on('close', code => {
+      if (code !== 0) return finish({ ok:false, reason:stderr.trim() || `Scanner exited with ${code}.` });
+      const sensitive = /(email|e-mail|phone|mobile|address|guardian|parent|birth|dob|medical|allerg|payment|balance|autopay|(?:first|middle|last|full)\s+name|student\s*(?:name|id)|family\s*(?:name|id)|emergency|waiver|contact|account\s*(?:id|number)|@|\b\d{3}[-. )]\d{3}[-. ]\d{4}\b)/i;
+      const entryRole = /(AXTextField|AXTextArea|AXSecureTextField|text field|text area)/i;
+      const ignored = /(address and search bar|ask google|search field|filter|find)/i;
+      const regions = [];
+      for (const line of stdout.split(/\r?\n/)) {
+        const parts = line.split('|'); if (parts.length < 5) continue;
+        const [x,y,w,h] = parts.slice(0,4).map(Number); const text = parts.slice(4).join('|');
+        if (![x,y,w,h].every(Number.isFinite) || ignored.test(text)) continue;
+        const isEntry = entryRole.test(text);
+        const isSensitive = sensitive.test(text);
+        if (!isEntry && !isSensitive) continue;
+        const padding = 10;
+        const labelExpansion = isSensitive && !isEntry ? Math.max(w + 300, 380) : w + padding * 2;
+        regions.push({ left:x - display.bounds.x - padding, top:y - display.bounds.y - padding, width:labelExpansion, height:h + padding * 2 });
+      }
+      finish({ ok:true, regions:mergeRedactionRegions(regions, display.size.width, display.size.height) });
+    });
+    timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch {} finish({ ok:false, reason:'Sensitive-region scan timed out.' }); }, 3500);
+  });
+}
+async function scanSensitiveImage(png, width, height) {
+  const ocrScale = 2;
+  const ocrPng = await sharp(png).resize({ width:width * ocrScale }).grayscale().normalize().sharpen().png().toBuffer();
+  return new Promise(resolve => {
+    const binary = process.platform === 'darwin' && fs.existsSync('/opt/homebrew/bin/tesseract') ? '/opt/homebrew/bin/tesseract' : null;
+    if (!binary) return resolve({ ok:false, reason:'Local OCR is unavailable.' });
+    const child = spawn(binary, ['stdin','stdout','-l','eng','--psm','11','tsv'], { stdio:['pipe','pipe','pipe'] });
+    let stdout = '', stderr = '', settled = false, timer;
+    const finish = result => { if (settled) return; settled = true; if (timer) clearTimeout(timer); resolve(result); };
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', error => finish({ ok:false, reason:error.message }));
+    child.on('close', code => {
+      if (code !== 0) return finish({ ok:false, reason:stderr.trim() || `OCR exited with ${code}.` });
+      const lines = new Map();
+      for (const row of stdout.split(/\r?\n/).slice(1)) {
+        const columns = row.split('\t'); if (columns.length < 12 || columns[0] !== '5') continue;
+        const [left,top,wordWidth,wordHeight] = columns.slice(6,10).map(value => Number(value) / ocrScale);
+        const text = columns.slice(11).join('\t').trim(); if (!text || ![left,top,wordWidth,wordHeight].every(Number.isFinite)) continue;
+        const key = `${columns[2]}:${columns[3]}:${columns[4]}`;
+        const line = lines.get(key) || { words:[], left, top, right:left + wordWidth, bottom:top + wordHeight };
+        line.words.push(text); line.left = Math.min(line.left,left); line.top = Math.min(line.top,top); line.right = Math.max(line.right,left + wordWidth); line.bottom = Math.max(line.bottom,top + wordHeight); lines.set(key,line);
+      }
+      const sensitive = /(email|e-mail|phone|mobile|address|guardian|parent|birth|dob|medical|allerg|payment|balance|autopay|(?:first|middle|last|full)\s+name|student\s*(?:name|id)|family\s*(?:name|id)|emergency|waiver|contact|account\s*(?:id|number)|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\b\d{3}[-. )]\d{3}[-. ]\d{4}\b|\b(?:EDU|STU|ACC|FAM)-[A-Z0-9-]{4,}\b|\b\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}\b)/i;
+      const commonHeading = /^(student details|education|course|academic year|program|notification|menu|home|enabled|save|cancel)$/i;
+      const properName = /\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b/;
+      const regions = [];
+      for (const line of lines.values()) {
+        const text = line.words.join(' ');
+        const matched = sensitive.test(text) || (properName.test(text) && !commonHeading.test(text.trim()));
+        if (!matched) continue;
+        const labelLike = /(email|phone|mobile|address|guardian|parent|birth|medical|payment|balance|(?:first|middle|last|full)\s+name|student|family|emergency|waiver|contact|account)/i.test(text);
+        regions.push({ left:line.left - 12, top:line.top - 10, width:labelLike ? Math.max(line.right - line.left + 360, 440) : line.right - line.left + 24, height:Math.max(line.bottom - line.top + 20, labelLike ? 86 : 26) });
+      }
+      finish({ ok:true, regions:mergeRedactionRegions(regions, width, height) });
+    });
+    child.stdin.end(ocrPng);
+    timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch {} finish({ ok:false, reason:'Local OCR timed out.' }); }, 8000);
+  });
+}
+async function blurSensitiveRegions(png, regions) {
+  if (!regions.length) return png;
+  const composites = [];
+  for (const region of regions) {
+    const input = await sharp(png).extract(region).blur(22).png().toBuffer();
+    composites.push({ input, left:region.left, top:region.top });
+  }
+  return sharp(png).composite(composites).png().toBuffer();
+}
+function runBinaryBuffer(file, args, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, args, { stdio:['ignore','pipe','pipe'] });
+    const chunks = []; let stderr = '';
+    const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch {} reject(new Error(`${path.basename(file)} timed out`)); }, timeout);
+    child.stdout.on('data', chunk => chunks.push(chunk));
+    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(stderr.trim() || `${path.basename(file)} exited with ${code}`));
+      resolve(Buffer.concat(chunks));
+    });
+  });
+}
+async function analyzeRecordingFile(file) {
+  if (!file || !fs.existsSync(file)) throw new Error('The selected recording is no longer available.');
+  const ffprobe = process.platform === 'win32' ? 'ffprobe' : '/opt/homebrew/bin/ffprobe';
+  const ffmpeg = process.platform === 'win32' ? 'ffmpeg' : '/opt/homebrew/bin/ffmpeg';
+  if (!fs.existsSync(ffprobe) && process.platform !== 'win32') throw new Error('FFprobe is unavailable; the recording was not imported.');
+  if (!fs.existsSync(ffmpeg) && process.platform !== 'win32') throw new Error('FFmpeg is unavailable; the recording was not imported.');
+  const metadata = JSON.parse((await runBinaryBuffer(ffprobe, ['-v','error','-show_entries','format=duration:stream=width,height','-of','json',file])).toString('utf8'));
+  const duration = Math.max(0, Number(metadata.format?.duration || 0));
+  const stream = (metadata.streams || []).find(item => item.width && item.height) || {};
+  const frameCount = Math.min(12, Math.max(3, Math.ceil(duration / 6) || 3));
+  const recordingDir = path.join(dataDir, 'recordings', `${Date.now()}-${path.basename(file).replace(/[^a-z0-9]+/gi,'-').toLowerCase()}`);
+  fs.mkdirSync(recordingDir, { recursive:true });
+  const frames = [];
+  for (let index = 0; index < frameCount; index++) {
+    const timestamp = duration ? Math.min(duration - 0.05, (duration * index) / Math.max(1, frameCount - 1)) : 0;
+    const raw = await runBinaryBuffer(ffmpeg, ['-hide_banner','-loglevel','error','-ss',String(Math.max(0,timestamp)),'-i',file,'-frames:v','1','-f','image2pipe','-vcodec','png','pipe:1'], 30000);
+    if (!raw.length) continue;
+    const image = sharp(raw); const imageMeta = await image.metadata();
+    const width = imageMeta.width || Number(stream.width) || 1; const height = imageMeta.height || Number(stream.height) || 1;
+    const scan = await scanSensitiveImage(raw, width, height);
+    if (!scan.ok) throw new Error(`Privacy scan failed at ${Math.round(timestamp)}s: ${scan.reason}`);
+    const output = await blurSensitiveRegions(raw, scan.regions || []);
+    const framePath = path.join(recordingDir, `frame-${String(index + 1).padStart(2,'0')}.png`);
+    fs.writeFileSync(framePath, output);
+    frames.push({ index:index + 1, at:timestamp, path:framePath, url:pathToFileURL(framePath).href, redactions:(scan.regions || []).length, privacy:'redacted' });
+  }
+  let previewUrl = null;
+  if (frames.length) {
+    const previewPath = path.join(recordingDir, 'redacted-preview.mp4');
+    try {
+      await runBinaryBuffer(ffmpeg, ['-y','-hide_banner','-loglevel','error','-framerate',String(frames.length / Math.max(duration, 1)),'-i',path.join(recordingDir,'frame-%02d.png'),'-c:v','libx264','-pix_fmt','yuv420p',previewPath], 60000);
+      if (fs.existsSync(previewPath)) previewUrl = pathToFileURL(previewPath).href;
+    } catch (error) { runtimeLog('recording.preview-failed', { message:error.message }); }
+  }
+  return {
+    name:path.basename(file), url:pathToFileURL(file).href, sourceUrl:pathToFileURL(file).href, previewUrl, privacy:'redacted', reviewRequired:true,
+    extractionStatus:'draft-review-required', duration, width:Number(stream.width) || null, height:Number(stream.height) || null,
+    frames,
+    extractedSteps:frames.map((frame, index) => ({
+      label:`Review recorded screen state ${index + 1}`,
+      note:`Video frame at ${Math.round(frame.at)}s. Confirm the action and reason manually before approval.`,
+      source:'video', at:frame.at, evidenceUrl:frame.url, privacy:'redacted', redactions:frame.redactions
+    }))
+  };
+}
 function startNativeGlass() {
+  // The native host is optional. It previously survived renderer restarts and
+  // could leave a stale gray window above the interactive Electron surface.
+  // Keep the recordable Electron UI as the reliable default; developers can
+  // explicitly opt back into the experimental host when working on it.
+  if (process.env.GYMSTANT_NATIVE_GLASS !== '1' || nativeGlass) return;
   const file = nativeGlassPath();
   if (!file || !fs.existsSync(file)) return;
   nativeGlass = spawn(file, [], { stdio: ['pipe', 'ignore', 'ignore'] });
@@ -235,36 +570,108 @@ function cancelActiveExecution() {
   runtimeLog('execution.cancelled', { pid });
   return true;
 }
-function arrangeWorkspace(reservedForGymstant = 118) {
+function gridRects(count, bounds) {
+  if (count <= 0) return [];
+  if (count === 1) return [{ ...bounds }];
+  if (count === 2) {
+    const left = Math.floor(bounds.width / 2);
+    return [
+      { x: bounds.x, y: bounds.y, width: left, height: bounds.height },
+      { x: bounds.x + left, y: bounds.y, width: bounds.width - left, height: bounds.height }
+    ];
+  }
+  const columns = Math.ceil(Math.sqrt(count));
+  const rows = Math.ceil(count / columns);
+  const cellWidth = Math.floor(bounds.width / columns);
+  const cellHeight = Math.floor(bounds.height / rows);
+  return Array.from({ length: count }, (_, index) => {
+    const column = index % columns;
+    const row = Math.floor(index / columns);
+    return {
+      x: bounds.x + column * cellWidth,
+      y: bounds.y + row * cellHeight,
+      width: column === columns - 1 ? bounds.width - column * cellWidth : cellWidth,
+      height: row === rows - 1 ? bounds.height - row * cellHeight : cellHeight
+    };
+  });
+}
+function setMacWindowBounds(target, rect) {
+  const appName = String(target.app || '').replace(/["\\]/g, '');
+  const index = Math.max(1, Number(target.index) || 1);
+  const script = `tell application "System Events"\nif exists process "${appName}" then\ntell process "${appName}"\nif (count of windows) >= ${index} then\nset position of window ${index} to {${rect.x}, ${rect.y}}\nset size of window ${index} to {${rect.width}, ${rect.height}}\nend if\nend tell\nend if\nend tell`;
+  spawn('/usr/bin/osascript', ['-e', script], { detached: true, stdio: 'ignore' }).unref();
+}
+function listMacManagedWindows(apps, callback) {
+  const names = JSON.stringify(apps);
+  const script = `const se=Application('System Events'); const names=${names}; const out=[]; names.forEach(name=>{ const process=se.processes.byName(name); if (!process.exists()) return; const count=process.windows.length; for (let index=1; index<=count; index++) out.push({app:name,index}); }); JSON.stringify(out);`;
+  const child = spawn('/usr/bin/osascript', ['-l', 'JavaScript', '-e', script], { stdio: ['ignore', 'pipe', 'ignore'] });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.on('close', () => {
+    try { callback(JSON.parse(output.trim() || '[]')); }
+    catch { callback([]); }
+  });
+}
+function preferredGymstantSide() {
+  try {
+    const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : {};
+    return state.settings?.workspaceSide === 'left' ? 'left' : 'right';
+  } catch { return 'right'; }
+}
+function arrangeWorkspace(reservedForGymstant = 0) {
   if (!managedApps.size) return;
   const bounds = screen.getPrimaryDisplay().workArea;
   const apps = [...managedApps];
-  const reservedBottom = Math.max(72, Math.min(reservedForGymstant, Math.floor(bounds.height * .44)));
-  const usableHeight = Math.max(360, bounds.height - reservedBottom);
-  if (process.platform === 'darwin' && managedApps.has('Google Chrome')) {
-    const halfW = Math.floor(bounds.width / 2), halfH = Math.floor(bounds.height / 2);
-    const script = `tell application "System Events"\nif exists process "Google Chrome" then\ntell process "Google Chrome"\nif (count of windows) >= 2 then\nset position of window 1 to {${bounds.x}, ${bounds.y}}\nset size of window 1 to {${halfW}, ${halfH}}\nset position of window 2 to {${bounds.x + halfW}, ${bounds.y}}\nset size of window 2 to {${bounds.width - halfW}, ${halfH}}\nend if\nend tell\nend if\nend tell`;
-    spawn('/usr/bin/osascript', ['-e', script], { detached: true, stdio: 'ignore' }).unref();
-    // Never let workspace layout override the compact working pill. Gymstant
-    // joins the grid after execution ends, or while the user intentionally peeks.
-    if (win && !win.isDestroyed() && (!executionBounds || executionPeeked) && (isExpanded || executionPeeked)) win.setBounds({ x: bounds.x + halfW, y: bounds.y + halfH, width: bounds.width - halfW, height: bounds.height - halfH }, true);
-    runtimeLog('workspace.arranged-grid', { chromeWindows: 2, gymstantCell: 'bottom-right', bounds });
-    return;
-  }
-  const columns = apps.length > 1 ? 2 : 1;
-  const cellWidth = Math.floor(bounds.width / columns);
-  apps.slice(0, 2).forEach((appName, index) => {
-    const rect = { x: bounds.x + index * cellWidth, y: bounds.y, width: cellWidth, height: usableHeight };
-    if (process.platform === 'darwin') {
-      const script = `tell application \"System Events\"\nif exists process \"${appName}\" then\ntell process \"${appName}\"\nif exists window 1 then\nset position of window 1 to {${rect.x}, ${rect.y}}\nset size of window 1 to {${rect.width}, ${rect.height}}\nend if\nend tell\nend if\nend tell`;
-      spawn('/usr/bin/osascript', ['-e', script], { detached: true, stdio: 'ignore' }).unref();
-    } else if (process.platform === 'win32') {
-      const name = appName === 'Google Chrome' ? 'chrome' : appName.toLowerCase();
-      const ps = `$p=Get-Process ${name} -ErrorAction SilentlyContinue|Where-Object {$_.MainWindowHandle -ne 0}|Select-Object -First 1; if($p){Add-Type -Name W -Namespace G -MemberDefinition '[DllImport(\"user32.dll\")]public static extern bool MoveWindow(IntPtr h,int x,int y,int w,int z,bool r);';[G.W]::MoveWindow($p.MainWindowHandle,${rect.x},${rect.y},${rect.width},${rect.height},$true)}`;
-      spawn('powershell.exe', ['-NoProfile', '-Command', ps], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  const showGymstant = executionPeeked || Number(reservedForGymstant) > 180;
+  if (process.platform !== 'darwin') return;
+  listMacManagedWindows(apps, workWindows => {
+    if (!workWindows.length) return;
+    const gymstantSide = preferredGymstantSide();
+    let workRects;
+    let gymstantRect = null;
+    if (!showGymstant) {
+      // One work window fills the display, two split left/right, and three or
+      // more use the smallest balanced grid that contains them.
+      workRects = gridRects(workWindows.length, bounds);
+    } else if (workWindows.length === 1) {
+      const gymWidth = Math.max(420, Math.floor(bounds.width / 3));
+      const workWidth = bounds.width - gymWidth;
+      if (gymstantSide === 'left') {
+        gymstantRect = { x: bounds.x, y: bounds.y, width: gymWidth, height: bounds.height };
+        workRects = [{ x: bounds.x + gymWidth, y: bounds.y, width: workWidth, height: bounds.height }];
+      } else {
+        workRects = [{ x: bounds.x, y: bounds.y, width: workWidth, height: bounds.height }];
+        gymstantRect = { x: bounds.x + workWidth, y: bounds.y, width: gymWidth, height: bounds.height };
+      }
+    } else if (workWindows.length === 2) {
+      const halfWidth = Math.floor(bounds.width / 2);
+      const halfHeight = Math.floor(bounds.height / 2);
+      if (gymstantSide === 'left') {
+        workRects = [
+          { x: bounds.x + halfWidth, y: bounds.y, width: bounds.width - halfWidth, height: bounds.height },
+          { x: bounds.x, y: bounds.y, width: halfWidth, height: halfHeight }
+        ];
+        gymstantRect = { x: bounds.x, y: bounds.y + halfHeight, width: halfWidth, height: bounds.height - halfHeight };
+      } else {
+        workRects = [
+          { x: bounds.x, y: bounds.y, width: halfWidth, height: bounds.height },
+          { x: bounds.x + halfWidth, y: bounds.y, width: bounds.width - halfWidth, height: halfHeight }
+        ];
+        gymstantRect = { x: bounds.x + halfWidth, y: bounds.y + halfHeight, width: bounds.width - halfWidth, height: bounds.height - halfHeight };
+      }
+    } else {
+      const cells = gridRects(workWindows.length + 1, bounds);
+      workRects = cells.slice(0, workWindows.length);
+      gymstantRect = cells[workWindows.length];
     }
+    workWindows.forEach((target, index) => setMacWindowBounds(target, workRects[index]));
+    if (gymstantRect && win && !win.isDestroyed()) {
+      windowMode = 'expanded'; isExpanded = true;
+      win.setBounds(gymstantRect, true);
+      win.webContents.send('window:mode', 'chatbar');
+    }
+    runtimeLog('workspace.arranged', { apps, workWindows: workWindows.length, showGymstant, gymstantSide, bounds, gymstantRect });
   });
-  runtimeLog('workspace.arranged', { apps, bounds, reservedBottom });
 }
 function deterministicAction(text) {
   const multiAppWorkflow = /\b(class software|frappe|education|roster|attendance|guardian|student|makeup class|class capacity)\b/i.test(text) || (/\b(?:and|then|after)\b/i.test(text) && text.length > 140);
@@ -396,10 +803,11 @@ function startLensTimer() {}
 function stopLensTimer() { if (lensTimer) { clearInterval(lensTimer); lensTimer = null; } }
 
 app.whenReady().then(() => {
-  ensureData(); createWindow();
+  ensureData(); killEventRecorderProcesses(); createWindow();
   globalShortcut.register('CommandOrControl+Shift+G', () => win?.webContents.send('capture:shortcut'));
+  globalShortcut.register('CommandOrControl+Shift+W', () => win?.webContents.send('workflow:shortcut-toggle'));
 });
-app.on('will-quit', () => { globalShortcut.unregisterAll(); if (lensTimer) clearInterval(lensTimer); stopNativeGlass(); });
+app.on('will-quit', () => { globalShortcut.unregisterAll(); if (lensTimer) clearInterval(lensTimer); stopNativeGlass(); killEventRecorderProcesses(); });
 app.on('window-all-closed', () => app.quit());
 
 ipcMain.on('window:resize', (_, expanded) => {
@@ -408,7 +816,7 @@ ipcMain.on('window:resize', (_, expanded) => {
   const area = screen.getDisplayMatching(old).workArea;
   const placement = currentPlacement();
   windowMode = expanded ? 'expanded' : 'chatbar';
-  const next = { width: windowMode === 'minimized' ? minimizedSize.width : old.width, height: expanded ? expandedSize.height : collapsedHeight };
+  const next = { width: windowMode === 'minimized' ? minimizedSize.width : old.width, height: expanded ? Math.min(900, area.height - 20) : collapsedHeight };
   const anchorX = placement.horizontal === 'left' ? old.x : placement.horizontal === 'right' ? old.x + old.width : old.x + old.width / 2;
   const anchorY = placement.vertical === 'up' ? old.y + old.height : old.y;
   let x = placement.horizontal === 'left' ? anchorX : placement.horizontal === 'right' ? anchorX - next.width : anchorX - next.width / 2;
@@ -488,6 +896,10 @@ ipcMain.on('window:content-height', (_, requested) => {
   const bounds = win.getBounds();
   const area = screen.getDisplayMatching(bounds).workArea;
   const height = Math.max(108, Math.min(Number(requested) || 108, area.height));
+  // Content changes (such as removing a workflow) must not collapse an
+  // already-expanded panel. Explicit height-resize events use a separate
+  // handler and remain allowed to reduce the window.
+  if (isExpanded && windowMode === 'expanded' && height < bounds.height) return;
   if (!isExpanded) collapsedHeight = height;
   const placement = currentPlacement();
   let y = placement.vertical === 'up' ? bounds.y + bounds.height - height : bounds.y;
@@ -503,7 +915,10 @@ ipcMain.handle('execution:begin', () => {
   executionPeeked = false;
   stopLensTimer();
   const area = screen.getDisplayMatching(executionBounds).workArea;
-  win.setBounds({ x: area.x + area.width - 194, y: area.y + 14, width: 180, height: 42 }, true);
+  windowMode = 'minimized'; isExpanded = false;
+  win.setBounds({ x: area.x + area.width - executionPillSize.width - 10, y: area.y + 10, ...executionPillSize }, true);
+  win.webContents.send('window:mode', 'minimized');
+  arrangeWorkspace(0);
   return true;
 });
 ipcMain.handle('execution:peek', () => {
@@ -513,6 +928,8 @@ ipcMain.handle('execution:peek', () => {
   const height = Math.min(Math.max(360, executionBounds.height), Math.floor(area.height * .42));
   const width = Math.min(Math.max(660, executionBounds.width), area.width - 24);
   const bounds = { x: Math.round(area.x + (area.width - width) / 2), y: area.y + area.height - height - 8, width, height };
+  windowMode = 'expanded'; isExpanded = true;
+  win.webContents.send('window:mode', 'chatbar');
   win.setBounds(bounds, true);
   arrangeWorkspace(height + 18);
   return true;
@@ -521,8 +938,10 @@ ipcMain.handle('execution:hide', () => {
   if (!win || !executionBounds) return false;
   executionPeeked = false;
   const area = screen.getDisplayMatching(executionBounds).workArea;
-  win.setBounds({ x: area.x + area.width - 214, y: area.y + 14, width: 200, height: 42 }, true);
-  arrangeWorkspace(72);
+  windowMode = 'minimized'; isExpanded = false;
+  win.setBounds({ x: area.x + area.width - executionPillSize.width - 10, y: area.y + 10, ...executionPillSize }, true);
+  win.webContents.send('window:mode', 'minimized');
+  arrangeWorkspace(0);
   return true;
 });
 ipcMain.handle('execution:end', () => {
@@ -530,7 +949,10 @@ ipcMain.handle('execution:end', () => {
   const restore = executionBounds;
   executionBounds = null;
   executionPeeked = false;
-  win.setBounds(restore, true);
+  windowMode = 'chatbar';
+  win.webContents.send('window:mode', 'chatbar');
+  if (!managedApps.size) win.setBounds(restore, true);
+  else setTimeout(() => arrangeWorkspace(470), 260);
   startLensTimer();
   return true;
 });
@@ -540,6 +962,8 @@ ipcMain.handle('settings:focus-resume', (_, seconds) => {
   runtimeLog('settings.focus-resume', { seconds: focusResumeSeconds });
   return focusResumeSeconds;
 });
+ipcMain.handle('app:restart', () => { app.relaunch(); app.exit(0); return true; });
+ipcMain.handle('app:quit', () => { app.quit(); return true; });
 ipcMain.handle('workflow:approve-learned', (_, actionId) => speedLayer.approve('missed-class-makeup', String(actionId || '')));
 ipcMain.handle('monitor:execute', async (_, actionId) => {
   if (actionId === 'demo-makeup-roster') {
@@ -672,19 +1096,73 @@ ipcMain.handle('chat:open', (_, id) => {
 ipcMain.handle('state:load', () => fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : null);
 ipcMain.handle('state:save', (_, state) => { ensureData(); fs.writeFileSync(stateFile, JSON.stringify(state, null, 2)); return true; });
 ipcMain.handle('data:open', async () => { const port = await startMemoryServer(); await shell.openExternal(`http://127.0.0.1:${port}`); return true; });
-ipcMain.handle('capture:screen', async (_, label = 'step', privacy = 'pixelated') => {
+ipcMain.handle('capture:screen', async (_, label = 'step', privacy = 'redacted') => {
   ensureData();
   const display = screen.getPrimaryDisplay();
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: display.size });
-  const source = sources[0];
-  if (!source || source.thumbnail.isEmpty()) return { error: 'Screen Recording permission is required.' };
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = path.join(shotsDir, `${stamp}-${String(label).replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.png`);
-  let image = source.thumbnail;
-  // Privacy mode intentionally removes fine text while retaining visual workflow context.
-  if (privacy === 'pixelated') image = image.resize({ width: Math.max(240, Math.round(display.size.width / 14)), height: Math.max(135, Math.round(display.size.height / 14)) }).resize({ width: display.size.width, height: display.size.height });
-  fs.writeFileSync(file, image.toPNG());
-  return { path: file, dataUrl: image.resize({ width: 420 }).toDataURL(), privacy, capturedAt: new Date().toISOString() };
+  const shouldRestore = Boolean(win && !win.isDestroyed() && win.isVisible());
+  // A capture must document the operator's workspace, never Gymstant itself.
+  // The native glass companion is stopped too, so it cannot leave a ghost box.
+  if (shouldRestore) { stopNativeGlass(); win.hide(); await new Promise(resolve => setTimeout(resolve, 180)); }
+  try {
+    // Scan the exposed page before capturing. The scanner reads only local macOS
+    // accessibility metadata and returns screen rectangles; it never receives
+    // or writes the screenshot pixels.
+    const scan = privacy === 'redacted' ? await scanSensitiveRegions(display) : { ok:true, regions:[] };
+    if (!scan.ok) return { error:`Privacy pre-scan failed, so no screenshot was saved: ${scan.reason}` };
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: display.size });
+    const source = sources.find(item => item.display_id === String(display.id)) || sources[0];
+    if (!source || source.thumbnail.isEmpty()) return { error: 'Screen Recording permission is required.' };
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(shotsDir, `${stamp}-${String(label).replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.png`);
+    let output = source.thumbnail.toPNG();
+    let savedPrivacy = privacy;
+    let redactionRegions = scan.regions || [];
+    if (privacy === 'redacted') {
+      const ocr = await scanSensitiveImage(output, display.size.width, display.size.height);
+      if (!ocr.ok && !redactionRegions.length) return { error:`Privacy scan could not verify this frame, so no screenshot was saved: ${ocr.reason}` };
+      redactionRegions = mergeRedactionRegions([...redactionRegions, ...(ocr.regions || [])], display.size.width, display.size.height);
+      output = await blurSensitiveRegions(output, redactionRegions);
+    }
+    else if (privacy === 'pixelated') {
+      const image = source.thumbnail.resize({ width:96, height:Math.max(54, Math.round(display.size.height / display.size.width * 96)) }).resize({ width:display.size.width, height:display.size.height, kernel:'nearest' });
+      output = image.toPNG();
+      savedPrivacy = 'pixelated';
+    }
+    // Only the processed buffer is persisted. The original frame existed in
+    // memory for this operation and is never written in redacted/pixelated mode.
+    fs.writeFileSync(file, output);
+    const thumbnail = await sharp(output).resize({ width:420, withoutEnlargement:true }).png().toBuffer();
+    runtimeLog('capture.saved', { privacy:savedPrivacy, redactions:redactionRegions.length, scanner:privacy==='redacted'?'local-accessibility+ocr':'none', file:path.basename(file) });
+    return { path:file, fullUrl:pathToFileURL(file).href, dataUrl:`data:image/png;base64,${thumbnail.toString('base64')}`, privacy:savedPrivacy, redactions:redactionRegions.length, scanStatus:'completed', capturedAt:new Date().toISOString() };
+  } finally {
+    if (shouldRestore && win && !win.isDestroyed()) { win.showInactive(); startNativeGlass(); syncNativeGlass(); }
+  }
+});
+ipcMain.handle('workflow:choose-recording', async () => {
+  const result = await dialog.showOpenDialog(win, { properties: ['openFile'], filters: [{ name: 'Video recording', extensions: ['mov', 'mp4', 'm4v', 'webm'] }] });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return analyzeRecordingFile(result.filePaths[0]);
+});
+ipcMain.handle('workflow:analyze-recording', async (_, file) => analyzeRecordingFile(file));
+ipcMain.handle('workflow:events-start', () => startWorkflowEventRecording());
+ipcMain.handle('workflow:events-stop', async () => stopWorkflowEventRecording());
+ipcMain.handle('workflow:events-snapshot', () => ({ count: activeEventTrace.length, lastAt: activeEventTrace.at(-1)?.at || null, events: activeEventTrace.slice() }));
+ipcMain.handle('workflow:events-replay', (_, payload = {}) => {
+  const trace = Array.isArray(payload.events) ? payload.events : [];
+  const events = trace.filter(event => ['mouse.click', 'key.press'].includes(event?.type));
+  if (!events.length) {
+    const transitions = trace.filter(event => event?.type === 'window.activate');
+    // A window-only trace is still useful locally: bring each recorded app to
+    // the foreground in order instead of sending it to a model or declaring it
+    // unavailable. Click/key replay remains reported as zero honestly.
+    for (const event of transitions) {
+      const app = String(event.app || '').trim();
+      if (!app || app === 'Gymstant') continue;
+      try { spawn('/usr/bin/open', ['-a', app], { detached: true, stdio: 'ignore' }).unref(); } catch {}
+    }
+    return { ok:true, events:0, windowTransitions:transitions.length, output:'window transitions replayed locally; no native click/key events were captured' };
+  }
+  return replayWorkflowEvents(events, payload.options || {});
 });
 ipcMain.handle('workflow:complete', (_, workflow) => {
   ensureData();
@@ -717,16 +1195,42 @@ ipcMain.handle('local:chat', async (_, payload) => {
     return deterministic;
   }
   const preparationOnly = /\b(?:do not|don't|never)\b[^.]{0,180}\b(?:send|submit|finalize|change)\b/i.test(latest?.content || '') || /\bwithout (?:me|my|human)\b/i.test(latest?.content || '');
-  const highRisk = !payload?.options?.approved && !preparationOnly && /\b(send|submit|publish|post|delete|remove|pay|purchase|buy|transfer|trade|password|credential|social security|sign|book|cancel|finalize)\b/i.test(latest?.content || '');
+  const highRisk = !payload?.options?.approved && !payload?.options?.preview && !preparationOnly && /\b(send|submit|publish|post|delete|remove|pay|purchase|buy|transfer|trade|password|credential|social security|sign|book|cancel|finalize)\b/i.test(latest?.content || '');
   if (highRisk) {
     const result = { text: 'I can prepare and inspect this task, but Gymstant requires the Monitor lane and a human final confirmation before executing consequential actions.', model: 'Gymstant safety gate' };
     fs.appendFileSync(transcriptFile, `${JSON.stringify({ role: 'assistant', content: result.text, model: result.model, at: new Date().toISOString() })}\n`);
     return result;
   }
+  if (payload?.options?.preview) {
+    if (/\bchrome|class software|client software|education|frappe\b/i.test(latest?.content || '')) managedApps.add('Google Chrome');
+    setTimeout(() => arrangeWorkspace(0), 80);
+    runtimeLog('preview.start', { route:'hermes-preview', title:normalizedLatest.slice(0, 100) });
+    const previewPrompt = `You are Gymstant's workflow preview operator. Execute only the preparation steps in the saved workflow below using computer_use. Open the target application if needed, visibly perform each step in order, and report what you actually verified. Do not save, send, submit, delete, publish, purchase, or complete any consequential action. If a step is ambiguous, stop and report the ambiguity instead of improvising.\n\nSAVED WORKFLOW PREVIEW:\n${latest?.content || normalizedLatest}`;
+    try {
+      // Preview owns the computer-use session. Do not pause it merely because
+      // the orchestration shell/Terminal is the current foreground app; that
+      // focus monitor was repeatedly interrupting otherwise valid replays.
+      // Computer-use providers often buffer their stdout until the whole turn
+      // is complete. A short "no output" watchdog therefore killed valid
+      // visible runs even while Hermes was actively driving the screen. Use a
+      // hard five-minute safety bound, but let the model/tool loop make
+      // progress without requiring shell output between each action.
+      runtimeLog('preview.timeout-config', { timeout_ms: 300000, progress_watchdog: false, model: readHermesModelConfig() });
+      const { stdout } = await runProcessGroup(gymstantCliPath(), ['-z', previewPrompt, '-t', 'computer_use'], { cwd:gymstantWorkdir(), timeout:300000, progressTimeout:0, focusAware:false, maxBuffer:1024 * 1024, env:hermesEnv() });
+      const clean = stdout.replace(/\u001b\[[0-9;]*m/g, '').trim();
+      if (!clean || isFalseSuccess(clean)) throw new Error(clean || 'Preview returned no verified result.');
+      runtimeLog('preview.complete', { route:'hermes-preview', result_chars:clean.length });
+      return { text:clean, model:'Hermes · visible workflow preview' };
+    } catch (error) {
+      runtimeLog('preview.failed', { route:'hermes-preview', message:String(error.message || error).slice(0, 240) });
+      throw error;
+    }
+  }
   const learnedRoute = actionable && speedLayer.match(normalizedLatest);
   if (learnedRoute === 'seeded-makeup-fastpath') {
     const fastStartedAt = Date.now();
     managedApps.add('Google Chrome');
+    setTimeout(() => arrangeWorkspace(0), 80);
     runtimeLog('route.start', { route: learnedRoute });
     try {
       const deliberate = !speedLayer.isApproved('missed-class-makeup');
@@ -751,23 +1255,19 @@ ipcMain.handle('local:chat', async (_, payload) => {
     }
   }
   if (!actionable) {
-    runtimeLog('route.start', { route: 'local-text' });
+    runtimeLog('route.start', { route: 'hermes-gpt55-chat' });
     let clean = '';
     try {
-      const response = await fetch('http://127.0.0.1:8899/v1/chat/completions', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(30000),
-        body: JSON.stringify({ model: 'gemma-4-12b-text', temperature: .15, max_tokens: 140, reasoning_format: 'none', chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'system', content: 'You are Gymstant, a concise privacy-first coworker for gyms. Answer in 60 words or fewer. Never claim you used tools or changed the computer.' }, ...messages.slice(-6)] })
-      });
-      if (!response.ok) throw new Error(`Local fast tier unavailable (${response.status})`);
-      const data = await response.json();
-      const raw = data.choices?.[0]?.message?.content || '';
-      clean = raw.replace(/<\|channel>[^\n]*\n?<channel\|>/g, '').replace(/<\|[^>]+>/g, '').trim();
+      const conversation = messages.slice(-6).map(item => `${item.role === 'user' ? 'User' : 'Gymstant'}: ${item.content}`).join('\n');
+      const prompt = `You are Gymstant, a concise privacy-first coworker for gyms. Answer the user's latest message in 60 words or fewer. Never claim you used tools or changed the computer.\n\n${conversation}`;
+      const { stdout } = await runQuickProcess(gymstantCliPath(), ['-z', prompt], { cwd: gymstantWorkdir(), timeout: 60000, env: hermesEnv() });
+      clean = stdout.replace(/\x1b\[[0-9;]*m/g, '').trim();
     } catch {
-      clean = 'Gymstant is running locally. Workflow capture, Review, Monitor, memory, and privacy-protected screenshots are ready. To enable AI chat, connect an OpenAI-compatible local model at 127.0.0.1:8899; to enable desktop actions, install Hermes Agent and set GYMSTANT_CLI if needed.';
+      clean = 'Gymstant could not reach GPT-5.5 just now. Workflow capture, Review, Monitor, memory, and privacy-protected screenshots remain available locally.';
     }
     if (/\b(?:I (?:have|'ve) (?:added|sent|saved|changed|updated|opened)|completed successfully|all updates are complete)\b/i.test(clean)) clean = 'I have not executed that action from ordinary conversation. Open Monitor and approve each visible final action so the approval is explicit and auditable.';
-    const result = { text: clean || 'I could not form a response.', model: 'Gemma 4 12B · local fast tier' };
-    runtimeLog('route.complete', { route: 'local-text', duration_ms: Date.now() - startedAt });
+    const result = { text: clean || 'I could not form a response.', model: 'GPT-5.5 · Hermes' };
+    runtimeLog('route.complete', { route: 'hermes-gpt55-chat', duration_ms: Date.now() - startedAt });
     fs.appendFileSync(transcriptFile, `${JSON.stringify({ role: 'assistant', content: result.text, model: result.model, at: new Date().toISOString() })}\n`);
     return result;
   }
@@ -780,6 +1280,7 @@ ipcMain.handle('local:chat', async (_, payload) => {
   if (/\bchrome|gmail\b/i.test(latest.content)) managedApps.add('Google Chrome');
   if (/\bclass software|frappe|education\b/i.test(latest.content)) managedApps.add('Google Chrome');
   if (/\bnumbers\b/i.test(latest.content)) managedApps.add('Numbers');
+  setTimeout(() => arrangeWorkspace(0), 80);
   runtimeLog('route.start', { route: 'hermes-computer-use', task_id: task.id, remaining_steps: task.steps.filter(s => s.status !== 'complete').length });
   try {
     let step;
