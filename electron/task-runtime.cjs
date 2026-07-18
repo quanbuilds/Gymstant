@@ -18,7 +18,12 @@ function taskId(request) {
 
 function deriveSteps(request) {
   const steps = [];
-  const classWork = /class software|frappe|education|roster|attendance|guardian|student|makeup class|class capacity/i.test(request);
+  // A URL such as education.localhost is not itself a request to inspect
+  // class records. Keep explicit navigation smoke tests out of the class
+  // verification route; otherwise Hermes receives the Ava/attendance stage
+  // and can legitimately report facts the user never asked it to inspect.
+  const navigationOnly = /\b(?:open|navigate|go to)\b[\s\S]{0,180}\b(?:stop when|stop once|do not click|only)\b/i.test(request);
+  const classWork = !navigationOnly && /class software|frappe|education|roster|attendance|guardian|student|makeup class|class capacity/i.test(request);
   const email = /gmail|e-?mail|draft/i.test(request);
   if (classWork) {
     steps.push({ id: 'class-verify', label: 'Verify the family, attendance, class options, and capacity in the class software.' });

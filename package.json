@@ -9,7 +9,8 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "vite build",
     "start": "electron .",
-    "pack:mac": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir",
+    "build:recorder": "swiftc electron/native/workflow-event-recorder.swift -o electron/native/workflow-event-recorder && mkdir -p 'electron/native/Gymstant Event Recorder.app/Contents/MacOS' && cp electron/native/workflow-event-recorder 'electron/native/Gymstant Event Recorder.app/Contents/MacOS/workflow-event-recorder' && cp electron/native/recorder-app/Contents/Info.plist 'electron/native/Gymstant Event Recorder.app/Contents/Info.plist' && codesign --force --deep --sign 'Apple Development: quan.stewart@yahoo.com (T4H296K77R)' 'electron/native/Gymstant Event Recorder.app'",
+    "pack:mac": "npm run build && npm run build:recorder && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir",
     "pack:mac:zip": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac zip --publish never",
     "pack:win": "npm run build && electron-builder --win dir --x64",
     "pack:win:portable": "npm run build && electron-builder --win portable --x64 --publish never",
@@ -18,18 +19,37 @@
   "build": {
     "appId": "com.stewartinc.gymstant",
     "productName": "Gymstant",
-    "directories": { "output": "release" },
-    "files": ["web-dist/**/*", "electron/**/*", "demo-training/MEMORY.md", "IDENTITY.md", "memory-dashboard.html", "package.json"],
-    "asarUnpack": ["electron/native/**/*"],
-    "mac": { "category": "public.app-category.productivity", "target": "dir", "artifactName": "Gymstant-${version}-macOS.${ext}" },
-    "win": { "target": "portable", "artifactName": "Gymstant-${version}-Windows.${ext}" }
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "web-dist/**/*",
+      "electron/**/*",
+      "demo-training/MEMORY.md",
+      "IDENTITY.md",
+      "memory-dashboard.html",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "electron/native/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": "dir",
+      "artifactName": "Gymstant-${version}-macOS.${ext}"
+    },
+    "win": {
+      "target": "portable",
+      "artifactName": "Gymstant-${version}-Windows.${ext}"
+    }
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
-    "vite": "latest",
+    "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "lucide-react": "latest"
+    "sharp": "^0.35.3",
+    "vite": "latest"
   },
   "devDependencies": {
     "concurrently": "latest",
