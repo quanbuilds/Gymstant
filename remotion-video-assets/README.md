@@ -8,6 +8,8 @@ These are the small, repo-local inputs for the Gymstant product demo. Use the re
 - `screenshots/gymstant-reviewing-class-software.png` — Gymstant reviewing a captured workflow beside the class-management system.
 - `recordings/gymstant-watch-workflow.mp4` — 16-second real Gymstant watch-state clip.
 - `recordings/gymstant-review-workflow.mp4` — 30-second real Gymstant review-state clip with the class software visible.
+- `recordings/ava-bennett-missed-class-workflow.mov` — original 2:14 portrait recording of the Ava Bennett missed-class workflow.
+- `recordings/ava-bennett-missed-class-workflow.txt` — Whisper transcript of the Ava Bennett recording.
 - `recordings/current-landing-demo-reference.mp4` — the existing landing-page demo. Do not use this as the final structure; it is here only to compare against the new workflow-led cut.
 
 ## Intended story
