@@ -4,6 +4,12 @@ contextBridge.exposeInMainWorld('gymstant', {
   load: () => ipcRenderer.invoke('state:load'),
   save: (state) => ipcRenderer.invoke('state:save', state),
   capture: (label, privacy) => ipcRenderer.invoke('capture:screen', label, privacy),
+  chooseRecording: () => ipcRenderer.invoke('workflow:choose-recording'),
+  analyzeRecording: (file) => ipcRenderer.invoke('workflow:analyze-recording', file),
+  startEventRecording: () => ipcRenderer.invoke('workflow:events-start'),
+  stopEventRecording: () => ipcRenderer.invoke('workflow:events-stop'),
+  eventRecordingSnapshot: () => ipcRenderer.invoke('workflow:events-snapshot'),
+  replayEventTrace: (events, options = {}) => ipcRenderer.invoke('workflow:events-replay', { events, options }),
   completeTeaching: (draft) => ipcRenderer.invoke('workflow:complete', draft),
   retireWorkflow: (workflow) => ipcRenderer.invoke('workflow:retire', workflow),
   approveLearnedWorkflow: (actionId) => ipcRenderer.invoke('workflow:approve-learned', actionId),
@@ -39,6 +45,8 @@ contextBridge.exposeInMainWorld('gymstant', {
   resizeMove: (point) => ipcRenderer.send('window:resize-move', point),
   resizeEnd: () => ipcRenderer.send('window:resize-end'),
   restoreChatbar: () => ipcRenderer.invoke('window:restore-chatbar'),
+  restartApp: () => ipcRenderer.invoke('app:restart'),
+  quitApp: () => ipcRenderer.invoke('app:quit'),
   contentHeight: (height) => ipcRenderer.send('window:content-height', height),
   setChatbarHeight: (height) => ipcRenderer.send('glass:chatbar-height', height),
   refreshLens: () => ipcRenderer.invoke('lens:refresh'),
@@ -48,5 +56,6 @@ contextBridge.exposeInMainWorld('gymstant', {
   onCollapsed: (callback) => ipcRenderer.on('window:collapsed', callback),
   onExecutionActivity: (callback) => ipcRenderer.on('execution:activity', (_, activity) => callback(activity)),
   onFocusResume: (callback) => ipcRenderer.on('execution:focus-resumed', (_, detail) => callback(detail)),
-  onShortcutCapture: (callback) => ipcRenderer.on('capture:shortcut', callback)
+  onShortcutCapture: (callback) => ipcRenderer.on('capture:shortcut', callback),
+  onShortcutWatchToggle: (callback) => ipcRenderer.on('workflow:shortcut-toggle', callback)
 });
